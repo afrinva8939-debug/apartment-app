@@ -1,4 +1,3 @@
 Main-Class: staticwebserver.SimpleHttpServer
 Class-Path: libs/mysql-connector-j-9.4.0.jar
 
-

@@ -8,6 +8,7 @@ import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.sql.*;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -40,7 +41,6 @@ public class SimpleHttpServer {
 
     // Tries multiple env var names provided by Clever Cloud add-on and falls back to defaults
     static Connection getConnection() throws SQLException {
-        // Clever Cloud provides MYSQL_ADDON_* (see your env vars)
         String host = System.getenv().getOrDefault("MYSQL_ADDON_HOST",
                 System.getenv().getOrDefault("DB_HOST", DEFAULT_DB_HOST));
         String port = System.getenv().getOrDefault("MYSQL_ADDON_PORT",
@@ -52,47 +52,106 @@ public class SimpleHttpServer {
         String pass = System.getenv().getOrDefault("MYSQL_ADDON_PASSWORD",
                 System.getenv().getOrDefault("DB_PASS", DEFAULT_DB_PASS));
 
-        // Build JDBC URL
         String url = String.format("jdbc:mysql://%s:%s/%s?useSSL=false&serverTimezone=UTC", host, port, db);
 
-        // Ensure driver loaded (modern drivers auto-register, but loading is harmless)
         try {
             Class.forName("com.mysql.cj.jdbc.Driver");
         } catch (ClassNotFoundException e) {
-            // If driver is not present, this will help debugging
             System.err.println("MySQL JDBC Driver not found on classpath: " + e.getMessage());
         }
 
         return DriverManager.getConnection(url, user, pass);
     }
 
-    // Handle static files (if you serve index.html) - minimal
+    // Handler that serves static files from /app/app on disk if available; otherwise from classpath /app/*
     static class StaticHandler implements HttpHandler {
+        private final Path webRoot = Paths.get("/app/app"); // container disk location
+        private final Map<String,String> contentTypes = defaultContentTypes();
+
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            String path = exchange.getRequestURI().getPath();
-            if ("/".equals(path) || "/index.html".equals(path)) {
-                InputStream is = SimpleHttpServer.class.getResourceAsStream("/app/index.html");
-                byte[] bytes;
-                if (is != null) {
-                    bytes = is.readAllBytes();
-                } else {
-                    String html = "<html><body><h3>Apartment app</h3><p>Use /api/apartments?q=...</p></body></html>";
-                    bytes = html.getBytes(StandardCharsets.UTF_8);
-                }
-                exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+            String path = sanitizePath(exchange.getRequestURI().getPath());
+
+            // Default to index.html for root or directory
+            if ("/".equals(path) || path.isEmpty()) path = "/index.html";
+
+            // Try disk first: /app/app + path
+            Path candidate = webRoot.resolve(path.substring(1)).normalize();
+            if (candidate.startsWith(webRoot) && Files.exists(candidate) && !Files.isDirectory(candidate)) {
+                serveFile(exchange, candidate);
+                return;
+            }
+
+            // Fallback: load from classpath (inside jar) at /app/...
+            InputStream is = SimpleHttpServer.class.getResourceAsStream("/app" + path);
+            if (is != null) {
+                byte[] bytes = readAllBytes(is);
+                String ct = contentTypeFor(path);
+                exchange.getResponseHeaders().set("Content-Type", ct);
                 exchange.sendResponseHeaders(200, bytes.length);
                 try (OutputStream os = exchange.getResponseBody()) {
                     os.write(bytes);
                 }
-            } else {
-                // Not found
-                String msg = "404 Not Found";
-                exchange.sendResponseHeaders(404, msg.length());
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(msg.getBytes(StandardCharsets.UTF_8));
-                }
+                return;
             }
+
+            // Not found - send 404
+            String msg = "404 Not Found";
+            exchange.sendResponseHeaders(404, msg.length());
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(msg.getBytes(StandardCharsets.UTF_8));
+            }
+        }
+
+        private void serveFile(HttpExchange exchange, Path file) throws IOException {
+            long size = Files.size(file);
+            String ct = contentTypeFor(file.getFileName().toString());
+            exchange.getResponseHeaders().set("Content-Type", ct);
+            exchange.sendResponseHeaders(200, size);
+            try (OutputStream os = exchange.getResponseBody(); InputStream is = Files.newInputStream(file)) {
+                byte[] buf = new byte[8192];
+                int r;
+                while ((r = is.read(buf)) != -1) os.write(buf, 0, r);
+            }
+        }
+
+        private String sanitizePath(String p) {
+            // remove query, keep leading slash
+            if (p == null) return "/";
+            int q = p.indexOf('?');
+            if (q >= 0) p = p.substring(0, q);
+            return p.replaceAll("/+", "/");
+        }
+
+        private static byte[] readAllBytes(InputStream is) throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int r;
+            while ((r = is.read(buf)) != -1) baos.write(buf, 0, r);
+            return baos.toByteArray();
+        }
+
+        private String contentTypeFor(String path) {
+            String ext = "";
+            int idx = path.lastIndexOf('.');
+            if (idx >= 0) ext = path.substring(idx + 1).toLowerCase();
+            return contentTypes.getOrDefault(ext, "application/octet-stream");
+        }
+
+        private static Map<String,String> defaultContentTypes() {
+            Map<String,String> m = new HashMap<>();
+            m.put("html", "text/html; charset=utf-8");
+            m.put("htm", "text/html; charset=utf-8");
+            m.put("css", "text/css; charset=utf-8");
+            m.put("js", "application/javascript; charset=utf-8");
+            m.put("json", "application/json; charset=utf-8");
+            m.put("png", "image/png");
+            m.put("jpg", "image/jpeg");
+            m.put("jpeg", "image/jpeg");
+            m.put("svg", "image/svg+xml");
+            m.put("ico", "image/x-icon");
+            m.put("txt", "text/plain; charset=utf-8");
+            return m;
         }
     }
 
@@ -105,24 +164,19 @@ public class SimpleHttpServer {
                     return;
                 }
 
-                // parse query params
                 URI uri = exchange.getRequestURI();
                 Map<String, String> q = queryToMap(uri.getRawQuery());
                 String qTerm = q.getOrDefault("q", "").trim();
 
                 List<Map<String, Object>> rows = new ArrayList<>();
 
-                // Query DB
                 try (Connection conn = getConnection()) {
                     String sql;
                     if (qTerm.isEmpty()) {
                         sql = "SELECT id, name, address, state, min_rent, max_rent, sqft, bed, bath FROM apartment_details LIMIT 200";
-                        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                            try (ResultSet rs = ps.executeQuery()) {
-                                while (rs.next()) {
-                                    rows.add(rowFromRs(rs));
-                                }
-                            }
+                        try (PreparedStatement ps = conn.prepareStatement(sql);
+                             ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) rows.add(rowFromRs(rs));
                         }
                     } else {
                         sql = "SELECT id, name, address, state, min_rent, max_rent, sqft, bed, bath " +
@@ -132,15 +186,12 @@ public class SimpleHttpServer {
                             ps.setString(1, like);
                             ps.setString(2, like);
                             try (ResultSet rs = ps.executeQuery()) {
-                                while (rs.next()) {
-                                    rows.add(rowFromRs(rs));
-                                }
+                                while (rs.next()) rows.add(rowFromRs(rs));
                             }
                         }
                     }
                 } catch (SQLException ex) {
                     ex.printStackTrace();
-                    // Return 500 with message
                     String err = "{\"error\":\"DB error: " + escapeJson(ex.getMessage()) + "\"}";
                     byte[] bytes = err.getBytes(StandardCharsets.UTF_8);
                     exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
@@ -149,7 +200,6 @@ public class SimpleHttpServer {
                     return;
                 }
 
-                // Convert rows to JSON (simple serializer)
                 String json = toJsonArray(rows);
                 byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
@@ -160,81 +210,4 @@ public class SimpleHttpServer {
 
             } catch (Exception e) {
                 e.printStackTrace();
-                String err = "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}";
-                byte[] bytes = err.getBytes(StandardCharsets.UTF_8);
-                exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-                exchange.sendResponseHeaders(500, bytes.length);
-                try (OutputStream os = exchange.getResponseBody()) { os.write(bytes); }
-            }
-        }
-
-        private Map<String, Object> rowFromRs(ResultSet rs) throws SQLException {
-            Map<String, Object> row = new LinkedHashMap<>();
-            row.put("id", rs.getObject("id"));
-            row.put("name", rs.getString("name"));
-            row.put("address", rs.getString("address"));
-            row.put("state", rs.getString("state"));
-            row.put("min_rent", rs.getString("min_rent"));
-            row.put("max_rent", rs.getString("max_rent"));
-            row.put("sqft", rs.getString("sqft"));
-            row.put("bed", rs.getString("bed"));
-            row.put("bath", rs.getString("bath"));
-            return row;
-        }
-    }
-
-    // Utility: parse query string into map
-    static Map<String,String> queryToMap(String query) {
-        if (query == null || query.isEmpty()) return Collections.emptyMap();
-        return Arrays.stream(query.split("&"))
-                .map(s -> s.split("=",2))
-                .collect(Collectors.toMap(
-                        a -> urlDecode(a[0]),
-                        a -> a.length>1 ? urlDecode(a[1]) : ""
-                                         ));
-    }
-
-    // Simple JSON array serializer for list of maps
-    static String toJsonArray(List<Map<String,Object>> rows) {
-        StringBuilder sb = new StringBuilder();
-        sb.append('[');
-        boolean firstRow = true;
-        for (Map<String,Object> row : rows) {
-            if (!firstRow) sb.append(',');
-            firstRow = false;
-            sb.append('{');
-            boolean first = true;
-            for (Map.Entry<String,Object> e : row.entrySet()) {
-                if (!first) sb.append(',');
-                first = false;
-                sb.append('"').append(escapeJson(e.getKey())).append('"').append(':');
-                Object v = e.getValue();
-                if (v == null) {
-                    sb.append("null");
-                } else if (v instanceof Number || v instanceof Boolean) {
-                    sb.append(v.toString());
-                } else {
-                    sb.append('"').append(escapeJson(String.valueOf(v))).append('"');
-                }
-            }
-            sb.append('}');
-        }
-        sb.append(']');
-        return sb.toString();
-    }
-
-    // URL decode
-    static String urlDecode(String s) {
-        try {
-            return java.net.URLDecoder.decode(s, StandardCharsets.UTF_8.name());
-        } catch (UnsupportedEncodingException e) {
-            return s;
-        }
-    }
-
-    // Escape strings for JSON minimal
-    static String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n").replace("\r","\\r");
-    }
-}
+                String err = "{\"error\":\"" + escapeJson(e.getMessa
