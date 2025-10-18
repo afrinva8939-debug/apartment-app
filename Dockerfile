@@ -1,32 +1,20 @@
-# Use small Java runtime
+# Use a small, stable Java runtime
 FROM eclipse-temurin:21-jre-jammy
 
 # Create app directory
 WORKDIR /app
 
-# Copy the runnable jar and the libs folder
+# Copy the runnable jar and any libs folder
+# (ApartmentApp.jar and libs/ should be in the repo root)
 COPY ApartmentApp.jar /app/ApartmentApp.jar
 COPY libs /app/libs
+COPY META-INF /app/META-INF
+COPY staticwebserver /app/staticwebserver
+COPY app /app/app
 
-# Expose port (Clever Cloud will map it)
-EXPOSE 8000
+# Expose the port Clever Cloud will give (we expect the app to use $PORT)
+EXPOSE 8080
 
-# Default PORT env (Clever Cloud will override this)
-ENV PORT=8000
-
-# Run the jar
-ENTRYPOINT ["sh", "-c", "java -jar /app/ApartmentApp.jar"]
-
-# Dockerfile (place at the root of apartment-app)
-FROM eclipse-temurin:21-jre-jammy
-
-WORKDIR /app
-
-# Copy runnable jar + libs folder (you commit these to your repo)
-COPY ApartmentApp.jar /app/ApartmentApp.jar
-COPY libs /app/libs
-
-EXPOSE 8000
-ENV PORT=8000
-
-ENTRYPOINT ["sh", "-c", "java -jar /app/ApartmentApp.jar"]
+# CMD: run the jar; the app will read PORT env var at runtime.
+# Use -cp to ensure libs on /app/libs/* are on the classpath if your code needs them.
+CMD ["sh", "-c", "java -cp /app/ApartmentApp.jar:/app/libs/* staticwebserver.SimpleHttpServer"]
