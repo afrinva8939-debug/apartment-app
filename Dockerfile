@@ -5,8 +5,8 @@ WORKDIR /app
 COPY ApartmentApp.jar /app/ApartmentApp.jar
 COPY libs /app/libs
 
-# Copy frontend static files so StaticHandler can serve them
+# ✅ Copy frontend (HTML, CSS, JS)
 COPY app /app/app
 
-# Run with Clever Cloud's dynamic PORT
+# Run with Clever Cloud’s provided port
 CMD ["sh", "-c", "java -cp /app/ApartmentApp.jar:/app/libs/* staticwebserver.SimpleHttpServer --server.port=$PORT"]
