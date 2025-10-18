@@ -1,125 +1,116 @@
 package staticwebserver;
 
-import com.sun.net.httpserver.HttpServer;
-import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
 
-import java.io.*;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.net.URLDecoder;
 import java.sql.*;
 import java.util.*;
-import java.util.stream.Collectors;
 
 public class SimpleHttpServer {
 
-    // Default local settings (used only when env vars are not present)
-    private static final String DEFAULT_DB_HOST = "localhost";
-    private static final String DEFAULT_DB_PORT = "3306";
-    private static final String DEFAULT_DB_NAME = "apartment";
-    private static final String DEFAULT_DB_USER = "root";
-    private static final String DEFAULT_DB_PASS = "";
+    private static final int port = 8000;
 
-    public static void main(String[] args) throws Exception {
-        int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "8000"));
+    public static void main(String[] args) throws IOException {
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/api/apartments", new ApartmentHandler());
         server.setExecutor(null);
         server.start();
-        System.out.println("? Server running on http://localhost:" + port);
+        System.out.println("✅ Server running on http://localhost:" + port);
     }
 
+    /**
+     * Establishes a connection to MySQL database.
+     * Works both locally and on Clever Cloud using environment variables.
+     */
     static Connection getConnection() throws SQLException {
-        // read from environment variables
-        String host = System.getenv().getOrDefault("DB_HOST", DEFAULT_DB_HOST);
-        String port = System.getenv().getOrDefault("DB_PORT", DEFAULT_DB_PORT);
-        String name = System.getenv().getOrDefault("DB_NAME", DEFAULT_DB_NAME);
-        String user = System.getenv().getOrDefault("DB_USER", DEFAULT_DB_USER);
-        String pass = System.getenv().getOrDefault("DB_PASS", DEFAULT_DB_PASS);
+        // Read Clever Cloud environment variables
+        String host = System.getenv().getOrDefault("MYSQL_ADDON_HOST", "localhost");
+        String port = System.getenv().getOrDefault("MYSQL_ADDON_PORT", "3306");
+        String db = System.getenv().getOrDefault("MYSQL_ADDON_DB", "apartment_db");
+        String user = System.getenv().getOrDefault("MYSQL_ADDON_USER", "root");
+        String pass = System.getenv().getOrDefault("MYSQL_ADDON_PASSWORD", "");
 
-        String url = String.format("jdbc:mysql://%s:%s/%s?useSSL=false&serverTimezone=UTC", host, port, name);
-        // Ensure driver exists on classpath (mysql connector JAR)
-        return DriverManager.getConnection(url, user, pass);
+        String jdbcUrl = String.format("jdbc:mysql://%s:%s/%s?useSSL=false&serverTimezone=UTC", host, port, db);
+
+        System.out.println("Connecting to DB: " + jdbcUrl);
+        return DriverManager.getConnection(jdbcUrl, user, pass);
     }
 
+    /**
+     * Handles /api/apartments endpoint.
+     */
     static class ApartmentHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            Map<String,String> qparams = queryToMap(exchange.getRequestURI().getQuery());
-            String q = qparams.getOrDefault("q","").trim();
+            Map<String, String> queryParams = queryToMap(exchange.getRequestURI().getQuery());
+            String q = queryParams.getOrDefault("q", "").trim();
 
-            List<Map<String,Object>> rows = new ArrayList<>();
+            List<Map<String, Object>> results = new ArrayList<>();
+
             try (Connection conn = getConnection()) {
-                String sql = "SELECT id, apt_result_apartment_name, apt_result_address, apt_result_min_rent, apt_result_max_rent, apt_result_sqft, apt_result_bed, apt_result_bath, state FROM apartment_details"
-                        + (q.isEmpty() ? " LIMIT 50" : " WHERE state LIKE ? OR apt_result_address LIKE ? OR apt_result_apartment_name LIKE ? LIMIT 100");
-                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                String sql = "SELECT * FROM apartment_details";
+                if (!q.isEmpty()) {
+                    sql += " WHERE state LIKE ?";
+                }
+
+                try (PreparedStatement stmt = conn.prepareStatement(sql)) {
                     if (!q.isEmpty()) {
-                        String like = "%" + q + "%";
-                        ps.setString(1, like);
-                        ps.setString(2, like);
-                        ps.setString(3, like);
+                        stmt.setString(1, "%" + q + "%");
                     }
-                    try (ResultSet rs = ps.executeQuery()) {
-                        ResultSetMetaData md = rs.getMetaData();
-                        while (rs.next()) {
-                            Map<String,Object> row = new LinkedHashMap<>();
-                            for (int i=1;i<=md.getColumnCount();i++) {
-                                row.put(md.getColumnLabel(i), rs.getObject(i));
-                            }
-                            rows.add(row);
+
+                    ResultSet rs = stmt.executeQuery();
+                    ResultSetMetaData meta = rs.getMetaData();
+
+                    while (rs.next()) {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        for (int i = 1; i <= meta.getColumnCount(); i++) {
+                            row.put(meta.getColumnName(i), rs.getObject(i));
                         }
+                        results.add(row);
                     }
                 }
-            } catch (SQLException ex) {
-                ex.printStackTrace();
-                sendJson(exchange, 500, Collections.singletonMap("error", ex.getMessage()));
+            } catch (Exception e) {
+                e.printStackTrace();
+                sendResponse(exchange, 500, "{\"error\": \"" + e.getMessage() + "\"}");
                 return;
             }
 
-            sendJson(exchange,200, rows);
+            // Convert results to JSON-like string
+            String jsonResponse = results.toString().replace("=", ":");
+            sendResponse(exchange, 200, jsonResponse);
         }
+    }
 
-        private Map<String,String> queryToMap(String query) {
-            if (query==null || query.isEmpty()) return Collections.emptyMap();
-            return Arrays.stream(query.split("&"))
-                    .map(kv -> kv.split("=",2))
-                    .collect(Collectors.toMap(
-                            k -> urlDecode(k[0]),
-                            k -> k.length>1 ? urlDecode(k[1]) : ""
-                                             ));
-        }
-        private String urlDecode(String s) {
-            try { return URLDecoder.decode(s,"UTF-8"); } catch (Exception e){ return s; }
-        }
+    /**
+     * Utility: send a JSON response
+     */
+    private static void sendResponse(HttpExchange exchange, int statusCode, String response) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+        exchange.sendResponseHeaders(statusCode, response.getBytes().length);
+        OutputStream os = exchange.getResponseBody();
+        os.write(response.getBytes());
+        os.close();
+    }
 
-        private void sendJson(HttpExchange exchange, int code, Object value) throws IOException {
-            String json = toJson(value);
-            exchange.getResponseHeaders().set("Content-Type","application/json; charset=UTF-8");
-            byte[] bytes = json.getBytes("UTF-8");
-            exchange.sendResponseHeaders(code, bytes.length);
-            try (OutputStream os = exchange.getResponseBody()) { os.write(bytes); }
-        }
+    /**
+     * Utility: parse URL query parameters
+     */
+    private static Map<String, String> queryToMap(String query) {
+        Map<String, String> result = new HashMap<>();
+        if (query == null) return result;
 
-        // tiny JSON generator (avoids extra dependency)
-        @SuppressWarnings("unchecked")
-        private String toJson(Object o){
-            if (o==null) return "null";
-            if (o instanceof Map) {
-                Map<String,Object> m = (Map)o;
-                return "{" + m.entrySet().stream()
-                        .map(e -> quote(e.getKey()) + ":" + toJson(e.getValue()))
-                        .collect(Collectors.joining(",")) + "}";
+        for (String param : query.split("&")) {
+            String[] entry = param.split("=");
+            if (entry.length > 1) {
+                result.put(entry[0], entry[1]);
+            } else {
+                result.put(entry[0], "");
             }
-            if (o instanceof Collection) {
-                Collection c = (Collection)o;
-                return "[" + c.stream().map(this::toJson).collect(Collectors.joining(",")) + "]";
-            }
-            if (o instanceof Number || o instanceof Boolean) return o.toString();
-            return quote(String.valueOf(o));
         }
-        private String quote(String s) {
-            String esc = s.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n").replace("\r","\\r");
-            return "\"" + esc + "\"";
-        }
+        return result;
     }
 }
